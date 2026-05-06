@@ -33,6 +33,7 @@ Issues = "https://github.com/rau/sleeper-mcp-skill/issues"
 
 [project.scripts]
 sleeper-mcp = "sleeper_mcp.server:main"
+sleeper-private-auth = "sleeper_mcp.private_auth_setup:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -8,6 +8,7 @@ from mcp.server.fastmcp import FastMCP
 
 from .client import SleeperClient
 from .config import SleeperConfig
+from .private_auth import private_auth_status as get_private_auth_status
 
 mcp = FastMCP("Sleeper Fantasy Sports")
 client = SleeperClient()
@@ -25,6 +26,17 @@ def api_summary() -> str:
 @mcp.resource("sleeper://config")
 def config() -> dict[str, Any]:
     return SleeperConfig.from_env().as_public_dict()
+
+
+@mcp.resource("sleeper://private-auth-status")
+def private_auth_status_resource() -> dict[str, Any]:
+    return get_private_auth_status()
+
+
+@mcp.tool()
+def private_auth_status(config_path: str | None = None) -> dict[str, Any]:
+    """Return redacted Sleeper private auth status without exposing secrets."""
+    return get_private_auth_status(config_path)
 
 
 @mcp.tool()

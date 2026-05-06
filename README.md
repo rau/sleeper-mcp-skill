@@ -191,6 +191,54 @@ SLEEPER_PRIVATE_ENABLE_MUTATIONS=0
 
 The private MCP should default to read-only even when authenticated. `SLEEPER_PRIVATE_ENABLE_MUTATIONS=1` should only unlock mutation tools after the host agent also asks for per-call confirmation.
 
+### Local Setup Script
+
+This repo includes a local setup script that stores secrets in macOS Keychain and writes only redacted/non-secret config to:
+
+```text
+~/Library/Application Support/sleeper-mcp-skill/config.json
+```
+
+From a checkout:
+
+```bash
+python3 scripts/setup_private_auth.py
+```
+
+It prompts for Sleeper email/phone/username and password in the terminal, calls the private GraphQL `login_query`, stores the returned token in Keychain, and writes config with `enable_mutations: false`.
+
+If you already have a token and do not want the script to perform login:
+
+```bash
+python3 scripts/setup_private_auth.py --manual-token
+```
+
+If cookies become necessary for a specific private endpoint, store a cookie header separately:
+
+```bash
+python3 scripts/setup_private_auth.py --manual-token --cookie
+```
+
+Check redacted status:
+
+```bash
+python3 scripts/setup_private_auth.py --status
+```
+
+Installed entrypoint:
+
+```bash
+sleeper-private-auth --status
+```
+
+The script never prints the token or cookie. It uses:
+
+```text
+security add-generic-password ... -w
+```
+
+with the secret passed through stdin instead of a command-line argument.
+
 ### Agent Preservation Model
 
 For a Codex skill or agent, the clean boundary is:
@@ -3198,6 +3246,11 @@ Resources:
 
 - `sleeper://api-summary`
 - `sleeper://config`
+- `sleeper://private-auth-status`
+
+Private auth status:
+
+- `private_auth_status`
 
 ### Local Codex Skill
 
