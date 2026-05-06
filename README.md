@@ -1469,6 +1469,313 @@ query plays {
 
 All operations in this section are `USER WRITE` unless marked as read. They change rosters, transaction state, or league assets.
 
+### Evidence Level
+
+Live network capture covered read/setup flows:
+
+- Opening the trade center loaded `roster_draft_picks` and `league_players`.
+- Opening player/free-agent detail loaded `league_transactions_by_player`, `get_player_news_for_ids`, and `get_player_news`.
+- League and trade pages loaded `league_transactions_filtered`.
+
+The final submit mutations below were recovered from the web bundle, not executed against the logged-in account:
+
+- `propose_trade`
+- `accept_trade`
+- `reject_trade`
+- `force_cancel_transaction`
+- `process_transaction`
+- `league_create_transaction`
+- `submit_waiver_claim`
+- `cancel_waiver_claim`
+- `update_waiver_claim`
+
+### Map Direction For Player Assets
+
+The app flattens selected assets into player-id-to-roster-id maps before calling GraphQL:
+
+```js
+adds[player_id] = Number(roster_id)
+drops[player_id] = Number(roster_id)
+```
+
+For a two-team player trade, model both sides explicitly:
+
+```json
+{
+  "adds": {
+    "player_from_roster_1": 2,
+    "player_from_roster_2": 1
+  },
+  "drops": {
+    "player_from_roster_1": 1,
+    "player_from_roster_2": 2
+  }
+}
+```
+
+In words: `adds` maps each player to the roster receiving that player; `drops` maps the same player to the roster giving that player up. For free-agent and waiver claims, `adds` is the claiming roster and `drops` is the roster dropping the player.
+
+For a private MCP, the safe dry-run should render the resolved player names and roster names from both maps before sending anything.
+
+### Send Trade Cookbook
+
+Operation: `propose_trade`
+
+Inputs:
+
+- `league_id`
+- `adds`: player id to destination roster id map
+- `drops`: player id to source roster id map
+- `draft_picks`: array of selected dynasty pick assets
+- `waiver_budget`: array of selected FAAB/waiver-budget assets
+- optional `expires_at`: Unix timestamp seconds
+- optional `reject_transaction_id` and `reject_transaction_leg` for counteroffers
+
+The web UI builds this call from:
+
+```js
+proposeTrade(
+  leagueId,
+  adds,
+  drops,
+  draftPicks,
+  waiverBudget,
+  expiresAt,
+  rejectTransactionId,
+  rejectTransactionLeg
+)
+```
+
+GraphQL:
+
+```graphql
+mutation propose_trade(
+  $k_adds: [String],
+  $v_adds: [Int],
+  $k_drops: [String],
+  $v_drops: [Int]
+) {
+  propose_trade(
+    league_id: "<league_id>",
+    draft_picks: <draft_picks_array>,
+    k_adds: $k_adds,
+    v_adds: $v_adds,
+    k_drops: $k_drops,
+    v_drops: $v_drops,
+    waiver_budget: <waiver_budget_array>,
+    expires_at: <optional_unix_seconds>,
+    reject_transaction_id: "<optional_transaction_id>",
+    reject_transaction_leg: <optional_leg>
+  ) {
+    adds
+    consenter_ids
+    created
+    creator
+    drops
+    league_id
+    leg
+    metadata
+    roster_ids
+    settings
+    status
+    status_updated
+    transaction_id
+    draft_picks
+    type
+    player_map
+    waiver_budget
+  }
+}
+```
+
+Variables for the two-team example above:
+
+```json
+{
+  "k_adds": ["player_from_roster_1", "player_from_roster_2"],
+  "v_adds": [2, 1],
+  "k_drops": ["player_from_roster_1", "player_from_roster_2"],
+  "v_drops": [1, 2]
+}
+```
+
+Exploding offer expiration options observed in the UI:
+
+- `1hour`: current time plus 1 hour
+- `today`: end of current day
+- `24hours`: current time plus 24 hours
+- `2days`: current time plus 2 days
+- `1week`: current time plus 1 week
+- `2weeks`: current time plus 2 weeks
+
+Draft-pick and waiver-budget asset arrays are inserted directly into the GraphQL document as JSON-like values by the bundle. Before sending real pick/FAAB trades from an MCP, capture or build those asset objects from the same trade UI model and print the dry-run, because the read-only `roster_draft_picks` shape is only:
+
+```graphql
+roster_id
+season
+round
+owner_id
+```
+
+### Waiver Claim Cookbook
+
+Operation: `submit_waiver_claim`
+
+Inputs:
+
+- `league_id`
+- `adds`: player id to claiming roster id map
+- `drops`: player id to dropping roster id map
+- optional `settings`: string/int map, used for bid/priority settings
+
+GraphQL:
+
+```graphql
+mutation submit_waiver_claim(
+  $k_adds: [String],
+  $v_adds: [Int],
+  $k_drops: [String],
+  $v_drops: [Int],
+  $k_settings: [String],
+  $v_settings: [Int]
+) {
+  submit_waiver_claim(
+    league_id: "<league_id>",
+    k_adds: $k_adds,
+    v_adds: $v_adds,
+    k_drops: $k_drops,
+    v_drops: $v_drops,
+    k_settings: $k_settings,
+    v_settings: $v_settings
+  ) {
+    adds
+    consenter_ids
+    created
+    creator
+    drops
+    league_id
+    leg
+    metadata
+    roster_ids
+    settings
+    status
+    status_updated
+    transaction_id
+    type
+    player_map
+  }
+}
+```
+
+Claim one player and drop one player:
+
+```json
+{
+  "k_adds": ["free_agent_player_id"],
+  "v_adds": [1],
+  "k_drops": ["dropped_player_id"],
+  "v_drops": [1],
+  "k_settings": ["waiver_bid"],
+  "v_settings": [7]
+}
+```
+
+The exact setting key for FAAB should be confirmed from the claim modal capture for the target league before sending, because settings can vary by league configuration. The bundle confirms that waiver settings are passed as `$k_settings: [String]` and `$v_settings: [Int]`.
+
+### Instant Free-Agent Add/Drop Cookbook
+
+Operation: `league_create_transaction`
+
+Purpose: instant add/drop when a player is not subject to waiver processing.
+
+Inputs:
+
+- `league_id`
+- `type`, expected to include `free_agent` for normal instant add/drop flows
+- `adds`: player id to roster id map
+- `drops`: player id to roster id map
+
+GraphQL:
+
+```graphql
+mutation league_create_transaction(
+  $k_adds: [String],
+  $v_adds: [Int],
+  $k_drops: [String],
+  $v_drops: [Int]
+) {
+  league_create_transaction(
+    league_id: "<league_id>",
+    type: "free_agent",
+    k_adds: $k_adds,
+    v_adds: $v_adds,
+    k_drops: $k_drops,
+    v_drops: $v_drops
+  ) {
+    adds
+    consenter_ids
+    created
+    creator
+    drops
+    league_id
+    leg
+    metadata
+    roster_ids
+    settings
+    status
+    status_updated
+    transaction_id
+    type
+    player_map
+  }
+}
+```
+
+Add one free agent and drop one rostered player:
+
+```json
+{
+  "k_adds": ["free_agent_player_id"],
+  "v_adds": [1],
+  "k_drops": ["dropped_player_id"],
+  "v_drops": [1]
+}
+```
+
+Drop-only and add-only transactions are represented by leaving the other map empty.
+
+### Cancel Or Update Waiver Claim Cookbook
+
+Cancel:
+
+```graphql
+mutation cancel_waiver_claim {
+  cancel_waiver_claim(
+    league_id: "<league_id>",
+    leg: <leg>,
+    transaction_id: "<transaction_id>"
+  ) {
+    ...Transaction
+  }
+}
+```
+
+Update:
+
+```graphql
+mutation update_waiver_claim($k_settings: [String], $v_settings: [Int]) {
+  update_waiver_claim(
+    league_id: "<league_id>",
+    transaction_id: "<transaction_id>",
+    leg: <leg>,
+    k_settings: $k_settings,
+    v_settings: $v_settings
+  ) {
+    ...Transaction
+  }
+}
+```
+
 ### `league_create_transaction`
 
 Class: `USER WRITE`
