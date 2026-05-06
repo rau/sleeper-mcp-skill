@@ -225,10 +225,25 @@ Check redacted status:
 python3 scripts/setup_private_auth.py --status
 ```
 
+Browser-assisted setup:
+
+```bash
+python3 scripts/setup_private_auth_browser.py
+```
+
+This opens an isolated browser session at `https://sleeper.com/login`, lets you log in normally, captures the `login_query` GraphQL response from that isolated session, and writes the returned token to Keychain. It also stores cookies from that isolated browser session in a separate Keychain item unless `--no-store-cookies` is passed. It does not read your existing Chrome profile.
+
+Headless mode exists, but it is usually not useful for Sleeper login because a human often needs to complete login/captcha:
+
+```bash
+python3 scripts/setup_private_auth_browser.py --headless
+```
+
 Installed entrypoint:
 
 ```bash
 sleeper-private-auth --status
+sleeper-private-auth-browser
 ```
 
 The script never prints the token or cookie. It uses:

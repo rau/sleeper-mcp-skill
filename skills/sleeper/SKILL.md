@@ -61,5 +61,6 @@ Private auth setup, when explicitly requested:
 
 ```bash
 python3 scripts/setup_private_auth.py
+python3 scripts/setup_private_auth_browser.py
 python3 scripts/setup_private_auth.py --status
 ```
