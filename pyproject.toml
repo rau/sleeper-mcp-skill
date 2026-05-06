@@ -1,0 +1,46 @@
+[project]
+name = "sleeper-mcp-skill"
+version = "0.1.0"
+description = "A comprehensive MCP server and Codex skill for the Sleeper fantasy sports API."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Richard Dunn" }]
+keywords = ["mcp", "sleeper", "fantasy-football", "codex-skill"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Internet :: WWW/HTTP",
+]
+dependencies = [
+  "mcp>=1.13.0",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/rau/sleeper-mcp-skill"
+Repository = "https://github.com/rau/sleeper-mcp-skill"
+Issues = "https://github.com/rau/sleeper-mcp-skill/issues"
+
+[project.scripts]
+sleeper-mcp = "sleeper_mcp.server:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
