@@ -18,6 +18,8 @@ Operation classes:
 - `APP-AUTO WRITE`: state-changing calls the web app triggers during normal viewing, such as invite link creation or read receipts.
 - `USER WRITE`: changes a fantasy object and must not be submitted without explicit user confirmation.
 - `ADMIN WRITE`: changes league/admin state and must not be submitted without explicit user confirmation.
+- `AUTH WRITE`: logs in, logs out, verifies contact info, changes credentials, or otherwise affects account auth state.
+- `DANGEROUS AUTH WRITE`: destructive account-auth operation, such as account deletion.
 
 For this investigation, state-changing operations were documented from the bundle and captured UI setup flows, but final mutation submissions were not executed.
 
@@ -43,7 +45,7 @@ The web app sends JSON:
 }
 ```
 
-Authentication is via browser cookies on `sleeper.com`. The current app did not expose a separate official bearer-token API for team management, waivers, or trades.
+Authentication is via the web app's saved auth token plus normal browser cookies on `sleeper.com`. The current app did not expose a separate official OAuth-style bearer-token API for team management, waivers, or trades.
 
 ### Web Data REST
 
@@ -64,6 +66,582 @@ https://api.sleeper.app/v1
 ```
 
 This is the documented read-only public API used by the MCP server in this repo. It does not authenticate and does not support sending trades, accepting trades, adding/dropping players, or changing lineups.
+
+## Auth And Session Preservation
+
+This section is based on static bundle inspection, not by dumping the active browser session.
+
+### Request Auth Mechanics
+
+The web GraphQL wrapper posts to relative `/graphql`, which resolves to:
+
+```text
+POST https://sleeper.com/graphql
+```
+
+The same code path can resolve to `https://api.sleeper.com/graphql` in mobile/native-style environments.
+
+GraphQL requests include:
+
+```text
+Content-Type: application/json
+Accept: application/json
+X-Sleeper-GraphQL-Op: <operationName>
+Authorization: <stored token>
+X-Device-ID: <deviceUniqueId, if known>
+```
+
+The `Authorization` header value is the raw token string returned by Sleeper login/signup flows. The bundle does not prepend `Bearer`.
+
+The request interceptor only adds `Authorization` for relative URLs or allowlisted Sleeper domains:
+
+```text
+sleeperbot
+sleeper.com
+sleeper.app
+sleeper.im
+sleeper.dev
+blitzchat
+:4000
+```
+
+Cookies are still part of the browser session. Logout explicitly calls a cookie-aware endpoint with `credentials: "include"`.
+
+### Local Auth State
+
+On startup, the web app reads:
+
+```text
+token
+key
+```
+
+from its client storage wrapper. Login and signup persist:
+
+```text
+token
+user_id
+```
+
+Logout removes:
+
+```text
+token
+user_id
+blocked_users_data
+blockers_data
+preferences_data
+bans_data
+```
+
+### Refresh Behavior
+
+No explicit `refresh_token` string and no standalone refresh endpoint were found in the current web bundle.
+
+Instead, the app has an opportunistic token replacement path:
+
+1. A GraphQL or REST response can contain a replacement `token`.
+2. On API/GraphQL errors, if the response data contains `token`, the app stores that new token.
+3. The app dispatches an internal `API_ERROR_401_REFRESH` action for that replacement path.
+4. If a 401 has no replacement token, the app removes `token` and `user_id` and treats auth as invalid.
+
+For an MCP or agent, mirror this behavior:
+
+```text
+load token before each request
+send Authorization: <token>
+send Cookie header only from a local secret store or cookie jar
+after every response, check for top-level token or data.token
+if a replacement token appears, atomically update the auth store
+if 401 without replacement token, mark auth invalid and ask for login
+```
+
+### Recommended Private MCP Auth Store
+
+Do not put Sleeper auth in the repo, README, skill prompt, or MCP tool output.
+
+For local-only use, use one of:
+
+- macOS Keychain item, preferred.
+- A `0600` JSON file outside the repo, for example under `~/.cache/sleeper-mcp-skill/private-auth.json`.
+- Explicit environment variables for a one-off session.
+
+Suggested private auth shape:
+
+```json
+{
+  "token": "<redacted>",
+  "user_id": "<redacted>",
+  "device_id": "<optional redacted>",
+  "cookies": "<optional redacted Cookie header or cookie-jar reference>",
+  "updated_at": "2026-05-06T00:00:00Z"
+}
+```
+
+Suggested environment variables:
+
+```text
+SLEEPER_PRIVATE_GRAPHQL_URL=https://sleeper.com/graphql
+SLEEPER_PRIVATE_TOKEN=<redacted token>
+SLEEPER_PRIVATE_COOKIE=<redacted cookie header>
+SLEEPER_PRIVATE_DEVICE_ID=<optional redacted device id>
+SLEEPER_PRIVATE_AUTH_FILE=~/.cache/sleeper-mcp-skill/private-auth.json
+SLEEPER_PRIVATE_ENABLE_MUTATIONS=0
+```
+
+The private MCP should default to read-only even when authenticated. `SLEEPER_PRIVATE_ENABLE_MUTATIONS=1` should only unlock mutation tools after the host agent also asks for per-call confirmation.
+
+### Agent Preservation Model
+
+For a Codex skill or agent, the clean boundary is:
+
+1. The skill tells the agent to call the local MCP.
+2. The MCP owns auth loading, request headers, token refresh updates, and redaction.
+3. MCP tools never return the token, cookie, or full request headers.
+4. Read tools can run directly.
+5. Mutation tools return a dry-run plan first and require explicit confirmation before sending.
+
+This preserves auth across agent turns without pasting credentials into the chat context.
+
+## Auth GraphQL And Web Endpoints
+
+### `login_context_by_email_or_phone_or_username`
+
+Class: `READ`
+
+Purpose: inspect what login methods exist for an identifier.
+
+```graphql
+query login_context_by_email_or_phone_or_username {
+  login_context_by_email_or_phone_or_username(
+    email_or_phone_or_username: "<identifier>"
+  )
+}
+```
+
+Observed returned fields in the app state mapping:
+
+```graphql
+has_password
+has_email
+has_phone
+user_id
+display_name
+avatar
+real_name
+masked_email
+masked_phone
+```
+
+### `login_query` / `login`
+
+Class: `AUTH WRITE`
+
+Purpose: password login.
+
+```graphql
+query login_query(
+  $email_or_phone_or_username: String!,
+  $password: String,
+  $captcha: String
+) {
+  login(
+    email_or_phone_or_username: $email_or_phone_or_username,
+    password: $password,
+    captcha: $captcha
+  ) {
+    token
+    avatar
+    cookies
+    created
+    display_name
+    real_name
+    email
+    notifications
+    phone
+    user_id
+    verification
+    data_updated
+  }
+}
+```
+
+On success, the web app stores `token` and `user_id`.
+
+### Logout
+
+Class: `AUTH WRITE`
+
+Transport: web REST, not GraphQL.
+
+```text
+POST /web-api/auth/logout
+credentials: include
+```
+
+Purpose: invalidate/clear browser auth. The app then clears local auth-related storage.
+
+### `create_user`
+
+Class: `AUTH WRITE`
+
+Purpose: signup.
+
+The bundle names the mutation `create_user` but calls the GraphQL field `user`.
+
+```graphql
+mutation create_user($password: String, $captcha: String) {
+  user(
+    display_name: "<username>",
+    email_or_phone: "<email_or_phone>",
+    code: "<verification_code>",
+    avatar_url: "<optional_avatar_url>",
+    password: $password,
+    captcha: $captcha
+  ) {
+    avatar
+    created
+    display_name
+    real_name
+    email
+    notifications
+    phone
+    token
+    user_id
+    verification
+  }
+}
+```
+
+On success, the web app stores `token` and `user_id`.
+
+### `request_verification`
+
+Class: `AUTH WRITE`
+
+Purpose: send verification for email or phone, with optional captcha.
+
+```graphql
+mutation request_verification($captcha: String) {
+  request_verification(
+    email_or_phone: "<email_or_phone>",
+    captcha: $captcha
+  )
+}
+```
+
+### `create_verification_code`
+
+Class: `AUTH WRITE`
+
+Purpose: request a verification code for signup/contact verification.
+
+```graphql
+mutation create_verification_code($captcha: String) {
+  create_verification_code(
+    email_or_phone: "<email_or_phone>",
+    captcha: $captcha
+  )
+}
+```
+
+### `verify_verification_code`
+
+Class: `AUTH WRITE`
+
+Purpose: validate an email/phone verification code.
+
+```graphql
+mutation verify_verification_code {
+  verify_verification_code(
+    email_or_phone: "<email_or_phone>",
+    code: "<code>"
+  )
+}
+```
+
+### `create_phone_code`
+
+Class: `AUTH WRITE`
+
+Purpose: request a phone code.
+
+```graphql
+mutation create_phone_code {
+  create_phone_code(phone: "<phone>")
+}
+```
+
+### `verify_phone_code`
+
+Class: `AUTH WRITE`
+
+Purpose: verify a phone code.
+
+```graphql
+mutation verify_phone_code {
+  verify_phone_code(
+    phone: "<phone>",
+    code: "<code>"
+  )
+}
+```
+
+### `verify_contact_update`
+
+Class: `AUTH WRITE`
+
+Purpose: complete a contact-info update verification.
+
+```graphql
+mutation verify_contact_update {
+  verify_contact_update(code: "<code>") {
+    avatar
+    created
+    display_name
+    real_name
+    email
+    notifications
+    phone
+    token
+    user_id
+    verification
+  }
+}
+```
+
+This can return a new `token`; persist it if present.
+
+### `request_password_reset`
+
+Class: `AUTH WRITE`
+
+Purpose: request password reset.
+
+```graphql
+mutation request_password_reset($captcha: String) {
+  request_password_reset(
+    email_or_phone: "<email_or_phone>",
+    captcha: $captcha
+  )
+}
+```
+
+### `reset_password`
+
+Class: `AUTH WRITE`
+
+Purpose: reset password using a reset code.
+
+```graphql
+mutation reset_password {
+  reset_password(
+    code: "<code>",
+    password: "<new_password>"
+  )
+}
+```
+
+### `reset_password_with_code`
+
+Class: `AUTH WRITE`
+
+Purpose: reset password with email/phone plus code.
+
+```graphql
+mutation reset_password_with_code(
+  $email_or_phone: String!,
+  $password: String!,
+  $code: String!
+) {
+  reset_password_with_code(
+    email_or_phone: $email_or_phone,
+    password: $password,
+    code: $code
+  )
+}
+```
+
+### `change_password`
+
+Class: `AUTH WRITE`
+
+Purpose: change password for an authenticated user.
+
+```graphql
+mutation change_password {
+  change_password(
+    password: "<new_password>",
+    old_password: "<old_password>"
+  )
+}
+```
+
+### `update_user_display_name`
+
+Class: `USER WRITE`
+
+Purpose: update account display name.
+
+```graphql
+mutation updateUserDisplayName {
+  update_user_display_name(display_name: "<display_name>") {
+    avatar
+    created
+    display_name
+    real_name
+    email
+    notifications
+    phone
+    token
+    user_id
+    verification
+  }
+}
+```
+
+### `update_user_avatar_url`
+
+Class: `USER WRITE`
+
+Purpose: update account avatar.
+
+```graphql
+mutation updateUserAvatar {
+  update_user_avatar_url(avatar_url: "<avatar_url>") {
+    avatar
+    created
+    display_name
+    real_name
+    email
+    notifications
+    phone
+    token
+    user_id
+    verification
+  }
+}
+```
+
+### `delete_user`
+
+Class: `DANGEROUS AUTH WRITE`
+
+Purpose: delete account. Do not expose as an agent tool without a hard deny or multi-step manual confirmation.
+
+```graphql
+mutation delete_user {
+  delete_user(
+    email_or_phone_or_username: "<identifier>",
+    password: "<password>"
+  ) {
+    user_id
+  }
+}
+```
+
+### `update_preferences`
+
+Class: `USER WRITE`
+
+Purpose: update user/app preference rows.
+
+```graphql
+mutation update_preferences {
+  update_preferences(
+    names: ["<name>"],
+    values: ["<value>"],
+    type_id: "<type_id>"
+  )
+}
+```
+
+### `app_info`
+
+Class: `READ`
+
+Purpose: fetch app info/config.
+
+```graphql
+query app_info {
+  app_info
+}
+```
+
+### Invite Codes Adjacent To Auth
+
+These are not auth tokens, but they are involved in signup/join flows.
+
+`create_invite_link`
+
+Class: `APP-AUTO WRITE` or `USER WRITE`
+
+```graphql
+mutation create_invite_link {
+  create_invite_link(
+    type: "<invite_type>",
+    type_id: "<type_id>",
+    expires_at: <optional_timestamp>,
+    uses_remaining: <optional_count>,
+    code: "<optional_custom_code>"
+  ) {
+    code
+    expires_at
+    metadata
+    type
+    type_id
+    uses_remaining
+  }
+}
+```
+
+`get_code`
+
+Class: `READ`
+
+```graphql
+query get_code {
+  get_code(code: "<invite_code>") {
+    code
+    expires_at
+    metadata
+    type
+    type_id
+    uses_remaining
+  }
+}
+```
+
+`use_code`
+
+Class: `USER WRITE`
+
+```graphql
+mutation use_code {
+  use_code(code: "<invite_code>") {
+    code
+    expires_at
+    metadata
+    type
+    type_id
+    uses_remaining
+  }
+}
+```
+
+### SMS Download Link
+
+`send_download_link`
+
+Class: `AUTH WRITE`
+
+Purpose: send an app download link to a phone number.
+
+```graphql
+mutation send_download_link {
+  send_download_link(phone: "<phone>")
+}
+```
 
 ## Shared Encodings
 
@@ -2166,6 +2744,35 @@ This is the relevant operation set found in the current web bundle. `READ` opera
 - `league_sync_list_leagues`
 - `league_sync_create_league`
 
+### Auth And Account Operations
+
+- `login_context_by_email_or_phone_or_username`
+- `login_query` / `login`
+- `create_user`
+- `request_verification`
+- `create_verification_code`
+- `verify_verification_code`
+- `create_phone_code`
+- `verify_phone_code`
+- `verify_contact_update`
+- `request_password_reset`
+- `reset_password`
+- `reset_password_with_code`
+- `change_password`
+- `update_user_display_name`
+- `update_user_avatar_url`
+- `delete_user`
+- `update_preferences`
+- `app_info`
+- `send_download_link`
+
+### Invite Code Operations Adjacent To Auth
+
+- `create_invite_link`
+- `get_code`
+- `use_code`
+- `invite_friends`
+
 ### League Chat/Receipt Operations Seen During Fantasy Pages
 
 These are not core fantasy roster APIs, but they are triggered by league pages.
@@ -2189,27 +2796,14 @@ These are not core fantasy roster APIs, but they are triggered by league pages.
 
 ## Auth Handling For A Future Private MCP
 
-The official MCP in this repo intentionally uses only the public read-only API. A private API MCP would need a separate transport and stricter auth handling.
+The official MCP in this repo intentionally uses only the public read-only API. A private API MCP should use the auth model documented in "Auth And Session Preservation":
 
-Recommended model:
-
-1. Do not store Sleeper credentials in the repo.
-2. Do not copy cookies from Chrome storage.
-3. For local-only use, allow the user to provide a short-lived `Cookie` header via an environment variable or OS keychain item.
-4. Redact `cookie`, `authorization`, CSRF, and token-like values from logs and MCP tool results.
-5. Split tools into `read_*` and `mutate_*` namespaces.
-6. Require an explicit confirmation gate for every mutation tool.
-7. Dry-run every trade/waiver mutation by rendering the exact assets, roster ids, player names, picks, waiver budget, and action before sending.
-
-Possible environment variables for a private transport:
-
-```text
-SLEEPER_PRIVATE_GRAPHQL_URL=https://sleeper.com/graphql
-SLEEPER_PRIVATE_COOKIE=<redacted browser cookie header>
-SLEEPER_PRIVATE_ENABLE_MUTATIONS=0
-```
-
-Default should be read-only. `SLEEPER_PRIVATE_ENABLE_MUTATIONS=1` should still require per-call confirmation in the host agent.
+- Store the returned Sleeper `token` outside the repo.
+- Send it as raw `Authorization: <token>`.
+- Optionally keep a local cookie jar or `Cookie` header outside the repo.
+- Persist replacement tokens returned in response bodies.
+- Treat 401 without a replacement token as expired auth.
+- Keep all mutation tools behind explicit confirmation.
 
 ## MCP Server In This Repo
 
